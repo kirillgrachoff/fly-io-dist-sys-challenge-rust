@@ -1,11 +1,13 @@
 /// ```bash
 /// $ cargo build
-/// $ maelstrom test -w broadcast --bin ./target/debug/broadcast --node-count 5 --time-limit 20 --rate 10
+/// $ maelstrom test -w broadcast --bin ./target/debug/broadcast --node-count 5 --time-limit 20 --rate 10 --nemesis partition
 /// ````
 use async_trait::async_trait;
 use maelstrom::protocol::Message;
 use maelstrom::{done, Node, Result, Runtime};
 use serde::{Deserialize, Serialize};
+use core::borrow::Borrow;
+use core::hash::Hash;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -45,12 +47,33 @@ impl State {
         self.messages_list.clone()
     }
 
-    fn take_node(&mut self, node_id: String) -> Vec<u64> {
-        let drop_first = self.already_send.insert(node_id, self.messages_list.len());
-        let drop_first = drop_first.unwrap_or(0);
+    fn take_node<Q>(&self, node_id: &Q) -> (usize, Vec<u64>)
+    where
+        Q: ?Sized,
+        String: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        let drop_first = self.already_send.get(node_id);
+        let drop_first = drop_first.unwrap_or(&0);
         let slice = self.messages_list.as_slice();
-        let slice = &slice[drop_first..];
-        slice.into()
+        let slice = &slice[*drop_first..];
+        (*drop_first, slice.into())
+    }
+
+    fn update_node(&mut self, node_id: String, prev_len: usize, len: usize) {
+        let entry = self.already_send.get_mut(&node_id);
+        match entry {
+            Some(v) => {
+                if *v == prev_len {
+                    *v += len;
+                }
+            }
+            None => {
+                if prev_len == 0 {
+                    self.already_send.insert(node_id, len);
+                }
+            }
+        };
     }
 }
 
@@ -89,11 +112,19 @@ impl Node for BroadcastHandler {
         match msg {
             Ok(Request::Broadcast { message }) => {
                 self.s.lock().await.insert(message);
-                let neighbours = self.s.lock().await.neighbours.clone();
-                for n in neighbours {
-                    let messages = self.s.lock().await.take_node(n.clone());
+                // let neighbours = self.s.lock().await.neighbours.clone();
+                let mut rpcs = vec![];
+                for n in runtime.neighbours() {
+                    let (prev_len, messages) = self.s.lock().await.take_node(n);
+                    let len = messages.len();
                     let msg = Request::Update { messages };
-                    runtime.rpc(n, msg).await?;
+                    let rpc = runtime.rpc(n.clone(), msg).await?;
+                    rpcs.push((n.clone(), prev_len, len, rpc));
+                }
+                for (n, prev_len, len, rpc) in rpcs {
+                    if rpc.await.is_ok() {
+                        self.s.lock().await.update_node(n, prev_len, len);
+                    }
                 }
                 runtime.reply_ok(req).await?;
                 Ok(())
