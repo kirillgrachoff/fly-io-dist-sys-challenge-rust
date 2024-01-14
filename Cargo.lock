@@ -121,6 +121,7 @@ dependencies = [
  "async-trait",
  "maelstrom-node",
  "serde",
+ "tokio",
 ]
 
 [[package]]
