@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use maelstrom::protocol::Message;
 use maelstrom::{done, Node, Result, Runtime};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn main() -> Result<()> {
@@ -56,7 +56,7 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 enum Response {
-    GenerateOk { id: usize, },
+    GenerateOk { id: usize },
 }
 
 #[async_trait]
@@ -67,13 +67,13 @@ impl Node for UniqueIdHandler {
             Ok(Request::Init { node_id, node_ids }) => {
                 let mut s = self.s.as_ref().lock().unwrap();
                 let id: usize = node_id.strip_prefix("n").unwrap().parse().unwrap();
-                *s = SeedData::new(id , node_ids.len());
+                *s = SeedData::new(id, node_ids.len());
                 Ok(())
-            },
-            Ok(Request::Generate { }) => {
+            }
+            Ok(Request::Generate {}) => {
                 let id = self.s.lock().unwrap().take_one();
                 runtime.reply(req, Response::GenerateOk { id }).await
-            },
+            }
             _ => done(runtime, req),
         }
     }

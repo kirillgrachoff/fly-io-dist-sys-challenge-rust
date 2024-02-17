@@ -3,16 +3,16 @@
 /// $ maelstrom test -w broadcast --bin ./target/debug/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100
 /// ````
 use async_trait::async_trait;
+use core::borrow::Borrow;
+use core::hash::Hash;
 use maelstrom::protocol::Message;
 use maelstrom::{done, Node, Result, Runtime};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
-use core::borrow::Borrow;
-use core::hash::Hash;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 
 pub(crate) fn main() -> Result<()> {
@@ -157,9 +157,7 @@ impl BroadcastHandler {
 
     async fn wait_update(&self, old: u64) -> Result<()> {
         let mut rec = self.receiver.clone();
-        rec.wait_for(|ts| {
-            *ts > old
-        }).await?;
+        rec.wait_for(|ts| *ts > old).await?;
         Ok(())
     }
 
@@ -168,7 +166,9 @@ impl BroadcastHandler {
     }
 
     fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 }
 
@@ -177,9 +177,10 @@ impl Node for BroadcastHandler {
     async fn process(&self, runtime: Runtime, req: Message) -> Result<()> {
         let msg: Result<Request> = req.body.as_obj();
         match msg {
-            Ok(Request::Init { _node_id, _node_ids }) => {
-                Ok(())
-            }
+            Ok(Request::Init {
+                _node_id,
+                _node_ids,
+            }) => Ok(()),
             Ok(Request::Broadcast { message }) => {
                 self.s.lock().await.insert(message);
                 let generation = self.generation();
