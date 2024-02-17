@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use core::borrow::Borrow;
 use core::hash::Hash;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -20,15 +21,15 @@ pub(crate) fn main() -> Result<()> {
 
 async fn try_main() -> Result<()> {
     let handler = Arc::new(BroadcastHandler::new());
-    let h2 = handler.clone();
+    let handle = handler.clone();
 
     let runtime = Runtime::new().with_handler(handler);
     let r = runtime.clone();
 
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-            let _ = h2.update_neighbours(&runtime).await;
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            let _ = handle.update_neighbours(&runtime).await;
         }
     });
 
@@ -39,6 +40,7 @@ struct BroadcastHandler {
     s: Arc<Mutex<State>>,
     sender: watch::Sender<u64>,
     receiver: watch::Receiver<u64>,
+    generation: AtomicU64,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -128,11 +130,12 @@ impl BroadcastHandler {
             s: <_>::default(),
             sender,
             receiver,
+            generation: AtomicU64::default(),
         }
     }
 
     async fn update_neighbours(&self, runtime: &Runtime) -> Result<()> {
-        let _ = self.sender.send(0);
+        let next_generation = self.next_generation();
         let mut rpcs = vec![];
         for n in runtime.neighbours() {
             let (prev_len, messages) = self.s.lock().await.take_node(n);
@@ -143,16 +146,29 @@ impl BroadcastHandler {
         }
 
         for (n, prev_len, len, rpc) in rpcs {
-            if rpc.await.is_ok() {
-                self.s.lock().await.update_node(n, prev_len, len);
-            }
+            rpc.await?;
+            self.s.lock().await.update_node(n, prev_len, len);
         }
+
+        let _ = self.sender.send(next_generation);
 
         Ok(())
     }
 
-    async fn wait_update(&self) -> Result<()> {
-        Ok(self.receiver.clone().changed().await?)
+    async fn wait_update(&self, old: u64) -> Result<()> {
+        let mut rec = self.receiver.clone();
+        rec.wait_for(|ts| {
+            *ts > old
+        }).await?;
+        Ok(())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
     }
 }
 
@@ -166,7 +182,8 @@ impl Node for BroadcastHandler {
             }
             Ok(Request::Broadcast { message }) => {
                 self.s.lock().await.insert(message);
-                self.wait_update().await?;
+                let generation = self.generation();
+                self.wait_update(generation).await?;
                 runtime.reply_ok(req).await?;
                 Ok(())
             }
