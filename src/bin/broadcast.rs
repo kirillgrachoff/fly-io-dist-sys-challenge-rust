@@ -6,10 +6,12 @@ use async_trait::async_trait;
 use maelstrom::protocol::Message;
 use maelstrom::{done, Node, Result, Runtime};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use core::borrow::Borrow;
 use core::hash::Hash;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 pub(crate) fn main() -> Result<()> {
@@ -17,13 +19,26 @@ pub(crate) fn main() -> Result<()> {
 }
 
 async fn try_main() -> Result<()> {
-    let handler = Arc::new(BroadcastHandler::default());
-    Runtime::new().with_handler(handler).run().await
+    let handler = Arc::new(BroadcastHandler::new());
+    let h2 = handler.clone();
+
+    let runtime = Runtime::new().with_handler(handler);
+    let r = runtime.clone();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let _ = h2.update_neighbours(&runtime).await;
+        }
+    });
+
+    r.run().await
 }
 
-#[derive(Clone, Default)]
 struct BroadcastHandler {
     s: Arc<Mutex<State>>,
+    sender: watch::Sender<u64>,
+    receiver: watch::Receiver<u64>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -105,27 +120,53 @@ enum Response {
     TopologyOk {},
 }
 
+impl BroadcastHandler {
+    fn new() -> Self {
+        let (sender, receiver) = watch::channel(0);
+
+        BroadcastHandler {
+            s: <_>::default(),
+            sender,
+            receiver,
+        }
+    }
+
+    async fn update_neighbours(&self, runtime: &Runtime) -> Result<()> {
+        let _ = self.sender.send(0);
+        let mut rpcs = vec![];
+        for n in runtime.neighbours() {
+            let (prev_len, messages) = self.s.lock().await.take_node(n);
+            let len = messages.len();
+            let msg = Request::Update { messages };
+            let rpc = runtime.rpc(n.clone(), msg).await?;
+            rpcs.push((n.clone(), prev_len, len, rpc));
+        }
+
+        for (n, prev_len, len, rpc) in rpcs {
+            if rpc.await.is_ok() {
+                self.s.lock().await.update_node(n, prev_len, len);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn wait_update(&self) -> Result<()> {
+        Ok(self.receiver.clone().changed().await?)
+    }
+}
+
 #[async_trait]
 impl Node for BroadcastHandler {
     async fn process(&self, runtime: Runtime, req: Message) -> Result<()> {
         let msg: Result<Request> = req.body.as_obj();
         match msg {
+            Ok(Request::Init { _node_id, _node_ids }) => {
+                Ok(())
+            }
             Ok(Request::Broadcast { message }) => {
                 self.s.lock().await.insert(message);
-                // let neighbours = self.s.lock().await.neighbours.clone();
-                let mut rpcs = vec![];
-                for n in runtime.neighbours() {
-                    let (prev_len, messages) = self.s.lock().await.take_node(n);
-                    let len = messages.len();
-                    let msg = Request::Update { messages };
-                    let rpc = runtime.rpc(n.clone(), msg).await?;
-                    rpcs.push((n.clone(), prev_len, len, rpc));
-                }
-                for (n, prev_len, len, rpc) in rpcs {
-                    if rpc.await.is_ok() {
-                        self.s.lock().await.update_node(n, prev_len, len);
-                    }
-                }
+                self.wait_update().await?;
                 runtime.reply_ok(req).await?;
                 Ok(())
             }
